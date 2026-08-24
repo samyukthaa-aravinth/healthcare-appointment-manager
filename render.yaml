@@ -1,0 +1,40 @@
+# Blueprint deploy for the API. Create the database separately (Neon/Supabase)
+# or uncomment the databases block below to use Render Postgres.
+services:
+  - type: web
+    name: meridian-api
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install && npx prisma generate && npx prisma db push
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CLIENT_URL
+        sync: false
+      - key: SERVER_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: EMAIL_TRANSPORT
+        value: console
+      - key: EMAIL_FROM
+        value: Meridian Clinic <no-reply@meridian.health>
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: RUN_WORKER_IN_PROCESS
+        value: 'true'
+
+# databases:
+#   - name: meridian-db
+#     plan: free

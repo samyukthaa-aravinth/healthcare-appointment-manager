@@ -1,0 +1,22 @@
+# Local Postgres for development. The app itself runs with npm.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hcm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hcm
+    ports:
+      - '5432:5432'
+    volumes:
+      - hcm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  hcm_pgdata:

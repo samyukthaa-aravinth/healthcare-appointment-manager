@@ -1,0 +1,303 @@
+// Healthcare Appointment & Follow-up Manager — data model
+// Provider: PostgreSQL (Neon / Supabase / Railway free tiers all work)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum AppointmentStatus {
+  HELD // slot reserved, symptom form not submitted yet
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum CancelledBy {
+  PATIENT
+  DOCTOR
+  ADMIN
+  SYSTEM
+}
+
+enum LlmStatus {
+  OK
+  FALLBACK // LLM unavailable, deterministic fallback used
+  PENDING
+}
+
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+  DEAD // exhausted retries, needs human attention
+}
+
+enum ReminderStatus {
+  SCHEDULED
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  phone        String?
+  role         Role     @default(PATIENT)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  doctorProfile        DoctorProfile?
+  patientAppointments  Appointment[]  @relation("PatientAppointments")
+  calendarAccount      CalendarAccount?
+  medicationReminders  MedicationReminder[]
+
+  @@map("users")
+}
+
+model DoctorProfile {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  specialisation      String
+  qualification       String?
+  bio                 String?
+  consultationFee     Int      @default(0)
+  slotDurationMinutes Int      @default(30)
+  bufferMinutes       Int      @default(0)
+  timezone            String   @default("Asia/Kolkata")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workingHours WorkingHour[]
+  leaves       DoctorLeave[]
+  appointments Appointment[]
+  slotLocks    SlotLock[]
+
+  @@index([specialisation])
+  @@map("doctor_profiles")
+}
+
+// One row per weekday window. A doctor can have 2 windows a day (morning/evening).
+model WorkingHour {
+  id          String @id @default(cuid())
+  doctorId    String
+  dayOfWeek   Int // 0 = Sunday ... 6 = Saturday
+  startMinute Int // minutes from midnight, e.g. 540 = 09:00
+  endMinute   Int
+
+  doctor DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@unique([doctorId, dayOfWeek, startMinute])
+  @@index([doctorId, dayOfWeek])
+  @@map("working_hours")
+}
+
+model DoctorLeave {
+  id        String   @id @default(cuid())
+  doctorId  String
+  date      DateTime @db.Date
+  reason    String?
+  createdAt DateTime @default(now())
+
+  doctor DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@unique([doctorId, date])
+  @@index([date])
+  @@map("doctor_leaves")
+}
+
+/// The concurrency guard. One row per (doctor, start time) that is currently
+/// held or booked. The unique constraint is what actually prevents
+/// double-booking — two simultaneous inserts, one wins, the other gets P2002.
+/// Rows are deleted on cancellation or hold expiry, which frees the slot again.
+model SlotLock {
+  id        String   @id @default(cuid())
+  doctorId  String
+  startsAt  DateTime
+  expiresAt DateTime // holds expire; confirmed bookings get a far-future value
+  createdAt DateTime @default(now())
+
+  doctor      DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  appointment Appointment?
+
+  @@unique([doctorId, startsAt])
+  @@index([expiresAt])
+  @@map("slot_locks")
+}
+
+model Appointment {
+  id           String            @id @default(cuid())
+  patientId    String
+  doctorId     String
+  slotLockId   String?           @unique
+  startsAt     DateTime
+  endsAt       DateTime
+  status       AppointmentStatus @default(HELD)
+  holdExpiresAt DateTime?
+  reasonText   String?
+  cancelledBy  CancelledBy?
+  cancelReason String?
+  cancelledAt  DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  patient   User          @relation("PatientAppointments", fields: [patientId], references: [id], onDelete: Cascade)
+  doctor    DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  slotLock  SlotLock?     @relation(fields: [slotLockId], references: [id], onDelete: SetNull)
+
+  symptomReport       SymptomReport?
+  visitNote           VisitNote?
+  calendarEvents      CalendarEvent[]
+  medicationReminders MedicationReminder[]
+
+  @@index([doctorId, startsAt])
+  @@index([patientId, startsAt])
+  @@index([status, startsAt])
+  @@map("appointments")
+}
+
+/// Patient-submitted symptoms + the LLM pre-visit triage written back onto the
+/// same row. llmStatus tells the UI whether the doctor is reading AI output or
+/// the deterministic fallback.
+model SymptomReport {
+  id            String   @id @default(cuid())
+  appointmentId String   @unique
+  symptomsText  String
+  durationDays  Int?
+  severity      Int? // patient self-rating 1-10
+  existingConditions String?
+  currentMedications String?
+  allergies     String?
+
+  urgency            Urgency?
+  chiefComplaint     String?
+  suggestedQuestions Json? // string[]
+  llmStatus          LlmStatus @default(PENDING)
+  llmModel           String?
+  llmError           String?
+  generatedAt        DateTime?
+  createdAt          DateTime  @default(now())
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@map("symptom_reports")
+}
+
+/// Doctor's clinical notes + the LLM patient-friendly rewrite.
+model VisitNote {
+  id            String   @id @default(cuid())
+  appointmentId String   @unique
+  clinicalNotes String
+  diagnosis     String?
+  prescriptions Json // Medication[] — see docs/API.md
+  followUpAt    DateTime?
+  followUpNotes String?
+
+  patientSummary     String?
+  medicationSchedule Json?
+  followUpSteps      Json?
+  llmStatus          LlmStatus @default(PENDING)
+  llmModel           String?
+  llmError           String?
+  generatedAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@map("visit_notes")
+}
+
+model MedicationReminder {
+  id             String         @id @default(cuid())
+  appointmentId  String
+  patientId      String
+  medicationName String
+  dosage         String?
+  instruction    String?
+  scheduledFor   DateTime
+  status         ReminderStatus @default(SCHEDULED)
+  sentAt         DateTime?
+  createdAt      DateTime       @default(now())
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  patient     User        @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledFor])
+  @@map("medication_reminders")
+}
+
+/// Transactional outbox. Nothing sends email inline — every notification is a
+/// row here first, so a SendGrid outage never fails a booking and never loses a
+/// message. The worker drains it with exponential backoff.
+model NotificationOutbox {
+  id            String       @id @default(cuid())
+  dedupeKey     String       @unique
+  channel       String       @default("EMAIL")
+  template      String
+  toEmail       String
+  toName        String?
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  maxAttempts   Int          @default(6)
+  nextAttemptAt DateTime     @default(now())
+  lastError     String?
+  sentAt        DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@map("notification_outbox")
+}
+
+model CalendarAccount {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  provider     String   @default("google")
+  refreshToken String
+  accessToken  String?
+  expiresAt    DateTime?
+  calendarId   String   @default("primary")
+  connectedAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("calendar_accounts")
+}
+
+model CalendarEvent {
+  id              String   @id @default(cuid())
+  appointmentId   String
+  userId          String
+  externalEventId String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@unique([appointmentId, userId])
+  @@map("calendar_events")
+}
